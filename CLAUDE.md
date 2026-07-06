@@ -6,35 +6,35 @@ Claude can query the bond market, compute real yields, and track price history o
 
 ## Current state
 
-This is now a scaffolded (but still early-stage) Claude Code plugin:
+A working, installable Claude Code plugin, pushed to
+[GrishinSergey/ua-ovdp-plugin](https://github.com/GrishinSergey/ua-ovdp-plugin) (`master`):
 
-- `.claude-plugin/plugin.json` — plugin manifest (name `ua-ovdp-plugin`).
+- `.claude-plugin/plugin.json` — plugin manifest (name `ua-ovdp-plugin`). No `version` field
+  by design — see Known issues.
+- `.claude-plugin/marketplace.json` — makes this repo installable as its own single-plugin
+  marketplace (`source: "./"`, same repo). Without this file the plugin is NOT installable
+  from GitHub at all — `claude plugin install` requires a marketplace-registered plugin.
 - `.mcp.json` — wires the `ovdp-bonds` MCP server to `server.py`, launched via
-  `${CLAUDE_PLUGIN_ROOT}/.venv/bin/python` (see Known issues — not portable off this machine
-  yet).
+  `uv run --project ${CLAUDE_PLUGIN_ROOT} python server.py` — `uv` creates its own venv and
+  installs every dependency from `pyproject.toml`/`uv.lock` automatically on first launch.
+  The only external prerequisite is `uv` itself being installed. Verified end-to-end from a
+  simulated fresh machine (no `.venv`, no cached chromium build) via a real MCP client
+  session — see Known issues for the one thing this doesn't cover.
 - `scraper.py` — standalone Playwright scraper → writes a `bonds.json`-shaped snapshot.
-- `server.py` — FastMCP server that runs the scraper as a subprocess and exposes
-  query/analysis tools over MCP (stdio).
-- `engine/` — a separate analytics/portfolio-construction engine (position tracking, bond
-  comparison, 3 portfolio-building strategies), now wired into `server.py` via
-  `engine/services/market_bridge.py` — see [Analytics engine (engine/)](#analytics-engine-engine).
+- `server.py` — FastMCP server, 17 tools: market data/scraping (8, original), position
+  tracking + forecasting + portfolio construction (9, backed by `engine/`).
+- `engine/` — analytics/portfolio-construction engine (position tracking, bond comparison, 3
+  portfolio-building strategies), wired into `server.py` via `engine/services/market_bridge.py`
+  — see [Analytics engine (engine/)](#analytics-engine-engine).
 - `skills/` — empty, scaffolded for future skills (see `skills/README.md`). None written yet.
-- `README.md` — setup + local testing instructions (`claude --plugin-dir`).
-- `pyproject.toml` — package metadata, console script `ua-ovdp-mcp` (not yet defined as an
-  entry point in `[project.scripts]` — see Known issues).
+- `pyproject.toml` / `uv.lock` — package metadata + locked dependency versions (committed,
+  for reproducible installs across machines).
 
 What does **not** exist yet:
 
-- No actual skills, agents, or hooks — just the MCP server. `skills/` will grow as the
-  "large package of code for various logic" mentioned by the project owner gets built out;
-  each new capability likely becomes both new MCP tool(s) in `server.py`/new modules, and a
-  skill wrapping the common workflow.
-- No tests yet. `data/`/`market_history/` don't exist in this repo yet — the scraper itself
-  is confirmed working end-to-end (verified with a real run: 32 bonds, real yields/schedules,
-  3 currency-mismatch warnings), it just hasn't been run *inside this project* yet.
-- No git commits yet (repo initialized, first commit pending).
-- Not yet tested end-to-end as an installed plugin (`/reload-plugins` + `/mcp` verification
-  pending).
+- No actual skills, agents, or hooks — just the MCP server. `skills/` will grow as more
+  workflows get built on top of the 17 raw tools.
+- No tests.
 
 The `plugin-dev@claude-plugins-official` plugin is installed at project scope
 (`.claude/settings.json`) and was used to determine this structure (manifest layout,
@@ -216,13 +216,15 @@ model/schemas if a real discrepancy ever needs logging instead — nothing curre
 
 ## Dev environment
 
-- Python ≥3.10, deps in `pyproject.toml` (Playwright, BeautifulSoup4, loguru, pydantic(-settings),
-  scipy, `mcp>=1.28.0`). A `.venv/` already exists with these installed.
-- Playwright needs its browser binaries installed separately (`playwright install chromium`) —
-  confirmed installed and working on this machine (verified with a real scraper run).
-- Run the scraper directly: `python scraper.py [--log-level DEBUG] [--p24-schedules] [--inzhur-dump]`.
-- Run the MCP server standalone: `python server.py` (or via the `ua-ovdp-mcp` console script,
-  once that entry point actually exists — see Known issues).
+- Requires `uv` (the only real prerequisite — see README's "Requirements") and Python ≥3.10
+  (uv fetches a matching interpreter itself if none is on PATH). Deps live in
+  `pyproject.toml`/`uv.lock` (Playwright, BeautifulSoup4, loguru, pydantic(-settings), scipy,
+  `mcp>=1.28.0`).
+- Run the scraper directly: `uv run python scraper.py [--log-level DEBUG] [--p24-schedules] [--inzhur-dump]`.
+- Run the MCP server standalone: `uv run python server.py` (or via the `ua-ovdp-mcp` console
+  script, once that entry point actually exists — see Known issues).
+- `.venv/` is now a disposable, `uv`-managed artifact (gitignored) — don't hand-maintain it;
+  delete and let `uv run` recreate it if it ever gets into a weird state.
 
 ## Known issues
 
@@ -232,13 +234,14 @@ model/schemas if a real discrepancy ever needs logging instead — nothing curre
   so `not "false"` and `not "true"` are both `False`. The stderr handler is never added
   regardless of the flag; only the file log (`--log-file`) gets anything. Not blocking, but
   worth a one-line fix (`args.no_console_logs == "true"`) when next touching that code.
-- `.mcp.json` hardcodes `${CLAUDE_PLUGIN_ROOT}/.venv/bin/python` — works only because a
-  `.venv/` with all deps already exists at the plugin root on this machine. It is gitignored
-  and won't ship with the plugin, so this breaks on a fresh install elsewhere. Revisit
-  (`uv run`, a documented `pip install -e .` prerequisite, or similar) before distributing.
+- **`plugin.json` intentionally has no `version` field.** Per Claude Code's docs: if a
+  version is set (in `plugin.json` or the marketplace entry), users only get updates when
+  that string is bumped — pushing commits alone does nothing. Left unset on purpose while
+  this is under active development, so `claude plugin update` picks up every new commit on
+  `master` automatically. Add a real semver version once this stabilizes into actual releases.
 - `pyproject.toml` has no `[project.scripts]` entry, so the `ua-ovdp-mcp` console script that
   `server.py`'s docstring references doesn't actually exist yet. `.mcp.json` sidesteps this by
-  invoking `server.py` directly.
+  invoking `server.py` directly via `uv run`.
 - `inzhur_provider(..., dump=True)` writes `inzhur_dump.html/.txt` to CWD, not under `data/`
   (now gitignored either way).
 

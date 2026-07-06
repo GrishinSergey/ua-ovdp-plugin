@@ -233,6 +233,29 @@ def _xirr(cashflows: list[tuple[date, float]]) -> Optional[float]:
     return (lo + hi) / 2
 
 
+async def _ensure_playwright_browser() -> Optional[str]:
+    """Make sure Playwright's chromium build is installed before the scraper needs it.
+    `playwright install` is its own idempotent check (skips the download if the browser
+    matching this exact playwright version is already cached) — cheap enough to just call
+    every time rather than tracking install state ourselves. Different playwright package
+    versions expect different browser builds, so this can't be a one-time setup step done
+    once per machine; it has to be checked against whichever venv is actually running.
+    Returns an error string on failure, else None."""
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            str(PYTHON_BIN), "-m", "playwright", "install", "chromium",
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        _, stderr = await asyncio.wait_for(proc.communicate(), timeout=300)
+    except Exception as e:
+        return f"could not run 'playwright install chromium': {e}"
+    if proc.returncode != 0:
+        return (f"'playwright install chromium' failed (rc={proc.returncode}): "
+                f"{stderr.decode('utf-8', 'replace')[-800:]}")
+    return None
+
+
 # ══ tools: running the scraper ════════════════════════════════════════════
 
 @mcp.tool()
@@ -248,6 +271,9 @@ async def run_scraper(
     """
     Run the OVDP scraper (ovdp.in.ua + Приват24 + Inzhur) and save a fresh market
     snapshot. Takes ~10s-2min depending on universe size and p24_schedules.
+
+    First call on a machine/venv also installs Playwright's chromium build if it isn't
+    already cached (adds ~30-60s once; a no-op check on every call after that).
 
     By DEFAULT the result is written to a new timestamped file in the market dir:
         <MARKET_DIR>/<YYYYMMDDHHMMSS>.json     e.g. 20260706142200.json
@@ -275,6 +301,10 @@ async def run_scraper(
             "ok": False,
             "error": f"scraper not found at {SCRAPER_PATH} (override with OVDP_SCRAPER_PATH if intentional)"
         }
+
+    browser_err = await _ensure_playwright_browser()
+    if browser_err:
+        return {"ok": False, "error": browser_err}
 
     if output_path:
         out_path = Path(output_path).expanduser().resolve()

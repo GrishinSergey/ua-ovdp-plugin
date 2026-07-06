@@ -1,0 +1,17 @@
+{
+  "name": "ua-ovdp-plugin",
+  "description": "Single-plugin marketplace for ua-ovdp-plugin (Ukrainian OVDP bonds).",
+  "owner": {
+    "name": "Serhii Hryshyn",
+    "email": "sergey.grishin.dev@gmail.com"
+  },
+  "plugins": [
+    {
+      "name": "ua-ovdp-plugin",
+      "source": "./",
+      "description": "Query, analyze, and track Ukrainian government bonds (ОВДП) via ovdp.in.ua, Приват24, and Inzhur — real yields (XIRR), price history, data-quality warnings.",
+      "license": "MIT",
+      "keywords": ["ovdp", "bonds", "ukraine", "finance", "fixed-income", "mcp"]
+    }
+  ]
+}
