@@ -18,6 +18,7 @@ from engine.investment.forecast.finance import (
     CashflowItem,
     PRECISION,
 )
+from engine.investment.forecast.math_core import entry_price
 from engine.investment.domain.models import Bond
 
 _PRECISION = PRECISION
@@ -234,20 +235,26 @@ def _calculate_bond_forecast(
         warnings: list[str],
         broker: Optional[str] = None,
 ) -> Optional[BondForecastItem]:
-    ai_result = calculate_accrued_interest(bond, as_of, quantity=1)
-    accrued_interest_per_bond = ai_result.amount_per_bond
-
     # broker given -> compare_bonds() already excluded any bond without a price_for_broker
-    # match, so this is guaranteed non-None here. No broker -> same fallback as before.
-    clean_price = bond.price_for_broker(broker) if broker else bond.last_market_price
-    if clean_price is None:
-        clean_price = bond.face_value
+    # match, so this is guaranteed non-None here. No broker -> same fallback as before
+    # (entry_price() below falls back to face_value too; this check only decides whether
+    # to warn about it).
+    if (bond.price_for_broker(broker) if broker else bond.last_market_price) is None:
         warnings.append(
             f"{bond.isin}: ринкова ціна відсутня, використано номінал "
             f"({bond.face_value} {bond.currency})."
         )
 
-    dirty_price = (clean_price + accrued_interest_per_bond).quantize(PRECISION)
+    # entry_price() is the SINGLE canonical dirty<->clean conversion (see the module
+    # docstring in math_core.py) — do not reimplement this arithmetic here. This used to
+    # add accrued_interest_per_bond on top of bond.last_market_price/price_for_broker(),
+    # which are already dirty (domain/models.py) — a double-counted NKD that inflated
+    # dirty_price/actual_invested and produced skewed (sometimes absurdly negative)
+    # ytm_to_maturity below.
+    entry = entry_price(bond, as_of, broker)
+    clean_price = entry.clean_price
+    accrued_interest_per_bond = entry.accrued_interest
+    dirty_price = entry.dirty_price
 
     if dirty_price <= Decimal("0"):
         warnings.append(f"{bond.isin}: некоректна ціна входу ({dirty_price}), пропущено.")

@@ -54,7 +54,7 @@ ovdp.in.ua/bonds/<ISIN>      ──┤  (per-ISIN metadata,        list_bonds() 
 ovdp.in.ua/prices            ──┘  (Sense/Універі enrichment)  (or given) snapshot, filter/
                                                                shape server-side
                 reconcile()                                  compute_ytm()    → recomputed
-                 → bonds.json (v4)                            XIRR from real cashflows,
+                 → bonds.json (v5)                            XIRR from real cashflows,
                  → warnings[]                                 not the broker's number
 
                                                                market_info() / list_snapshots()
@@ -76,7 +76,32 @@ offer is not emitted at all, even if ovdp knows about it.
   `compute_ytm` recomputes XIRR from actual cashflows + price instead.
 - Cross-source disagreement (currency/maturity/coupon mismatches, stale broker payments not in
   the ovdp schedule, broker-only bonds with no ovdp metadata) → `output["warnings"]`, surfaced
-  via `get_warnings()`.
+  via `get_warnings()`. Of these, currency/maturity/coupon mismatches specifically mean a
+  bond's OWN computed numbers (price, YTM, NKD) would be actively wrong, not just
+  incomplete — `list_bonds`/`compare_bonds`/`build_target_portfolio` now exclude those bonds
+  by **default** (`server.py`'s `_categorize_warnings()`), surfacing the reason inline as
+  `data_warnings` (`{isin, message, status: "прибрано"|"неприбрано"}`) instead of requiring a
+  separate `get_warnings()` call before ranking. Broker-only/staleness warnings stay
+  informational only — the bond isn't excluded for those.
+- **Per-broker price fields (v5, additive):** `where_to_buy[]` entries now also carry
+  `dirty_price` (explicit alias of `price`, unchanged), `nominal_price` (clean, i.e.
+  `dirty_price` minus accrued interest), and `nkd_price` (accrued interest), computed at
+  scrape time from the bond's own coupon schedule (`scraper.py`'s `compute_price_breakdown()`
+  — deliberately duplicates `math_core.accrued_interest()`'s formula rather than importing
+  `engine/`, to keep the scraper dependency-free of it; see that function's docstring).
+  `nominal_price`/`nkd_price` are `null` for a bond with no past coupon yet. **Old snapshot
+  files predate these fields** — every reader must `.get()` them, never assume presence.
+  These fields are informational/display-only: nothing in `engine/` reads them —
+  `compare_bonds`/`position_metrics`/etc. always re-derive clean/dirty fresh at the actual
+  settlement date in use via `math_core.entry_price()`, deliberately, not as a stopgap:
+  a stored `nominal_price` is only valid exactly at `snapshot_taken_at`, every real call
+  uses a *different* settlement date (today, a backdated purchase, a future horizon), and
+  `entry_price()` is pure Decimal arithmetic (no I/O) — there's no staleness risk or
+  performance reason to prefer a cached field over recomputing, and trusting two
+  independently-updatable numbers (a stored one + a freshly computed one) instead of
+  deriving one from the other is exactly the kind of divergence that caused the
+  double-NKD bug below in the first place. No `commission_price` field yet — deferred
+  pending an independent reference/fair-value price, see Known limitations.
 
 ### Runtime data directories
 
@@ -109,7 +134,7 @@ invent a new convention.
 | Tool | Purpose |
 |---|---|
 | `run_scraper(...)` | Run the scraper subprocess, write a new timestamped snapshot, return a compact summary (never the raw log). |
-| `list_bonds(...)` | Filter/sort bonds server-side (currency, military flag, broker, yield range, maturity range) so the model doesn't pull the whole dataset into context. Response includes `snapshot_file`/`snapshot_taken_at`. |
+| `list_bonds(...)` | Filter/sort bonds server-side (currency, military flag, broker, yield range, maturity range) so the model doesn't pull the whole dataset into context. Response includes `snapshot_file`/`snapshot_taken_at` + `data_warnings` (bonds excluded by default for a currency/maturity/coupon mismatch, and why). |
 | `get_bond(isin)` | Full record for one ISIN, plus related warnings. Response includes `snapshot_file`/`snapshot_taken_at`. |
 | `get_warnings()` | Data-quality warnings from the last scrape. |
 | `compute_ytm(isin, ...)` | Recompute annualized yield (XIRR via bisection) from real cashflows + purchase price — the "honest" number vs. the broker-displayed one. Response includes `snapshot_file`/`snapshot_taken_at`. |
@@ -122,9 +147,9 @@ invent a new convention.
 | `remove_position(position_id)` | Delete a recorded position. |
 | `position_metrics(position_id, as_of=None, ...)` | Full P&L/YTM/duration/convexity for one owned position. Realized cashflows are auto-derived from the frozen schedule (dates between purchase and `as_of` assumed paid) — see engine/ section below. |
 | `portfolio_metrics(as_of=None, label=None, ...)` | Aggregate across all (or `label`-filtered) positions: totals, avg YTM/duration, currency/maturity breakdowns, monthly cashflow forecast. |
-| `simulate_reinvestment(reinvest_rate=0.15, years=3, ...)` | "What if I reinvest every coupon at X%" projection over the current portfolio. |
-| `compare_bonds(isins, ...)` | Rank 2+ candidate bonds (not yet owned) by effective annual return over a shared horizon. |
-| `build_target_portfolio(target_income, horizon_days, ...)` | Build a portfolio hitting a target income — 3 modes: `max_efficiency` (greedy, fewest bonds), `monthly_income` (even monthly coverage), `max_efficiency_reinvest` (month-by-month reinvestment simulation). |
+| `simulate_reinvestment(reinvest_rate=0.15, years=3, ...)` | "What if I reinvest every coupon at X%" projection over the current portfolio. Returns both `effective_annual_return` (with the reinvestment assumption) and `baseline_effective_annual_return` (`reinvest_rate=0`) side by side, so the portfolio's own quality isn't conflated with the reinvestment-rate assumption. |
+| `compare_bonds(isins, ...)` | Rank 2+ candidate bonds (not yet owned) by effective annual return over a shared horizon. Candidates with a currency/maturity/coupon mismatch are excluded by default before ranking (see `data_warnings` in the response and the Core invariant section above). |
+| `build_target_portfolio(target_income, horizon_days, ...)` | Build a portfolio hitting a target income — 3 modes: `max_efficiency` (greedy, fewest bonds), `monthly_income` (even monthly coverage), `max_efficiency_reinvest` (month-by-month reinvestment simulation). Same default candidate exclusion + `data_warnings` as `compare_bonds`. |
 
 ## Analytics engine (`engine/`)
 
@@ -142,7 +167,7 @@ every subpackage, a minimal `engine/settings.py` shim created, REIT-specific cod
 | `engine/investment/domain/models.py` | Core dataclasses: `Bond`, `Position`, `Portfolio`, `CouponPayment`, `ReceivedPayment`, `BrokerPrice`. Foundation for everything else. |
 | `engine/investment/forecast/finance.py` | Position/portfolio-level math: accrued interest, YTM (via `scipy.optimize.brentq`), simple yield, modified duration/convexity/DV01, full `PositionMetrics`/`PortfolioMetrics` (P&L, breakdowns, monthly cashflow forecast), reinvestment scenario simulation. |
 | `engine/investment/forecast/forecast_core.py` | `compare_bonds()` — ranks 2–10 candidate bonds over a horizon by effective annual return. |
-| `engine/investment/forecast/math_core.py` | Lower-level primitives (`bond_horizon_result`, `entry_price`, `coupons_in_horizon`, `real_income`) — the `efficiency = real_income / dirty_price` metric the portfolio engine is built on. |
+| `engine/investment/forecast/math_core.py` | Lower-level primitives (`bond_horizon_result`, `entry_price`, `coupons_in_horizon`, `real_income`) — the `efficiency = real_income / dirty_price` metric the portfolio engine is built on. **Also the single canonical dirty↔clean/НКД conversion** (`entry_price()`/`accrued_interest()`) — `forecast_core.py` and `finance.py` both delegate to it now instead of their own arithmetic (see Known limitations: double-NKD-counting bug). Any new code needing "price without accrued interest" should call `entry_price()`, not reimplement the formula. |
 | `engine/investment/forecast/strategy.py` | `StandardStrategy` vs `Privat24Strategy` — different conventions for "how much did I actually make," to match broker UIs. |
 | `engine/investment/portfolio/engine.py` | `build_portfolio(EngineRequest)` — dispatches to 3 modes: `max_efficiency` (optimizer.py, greedy), `monthly_income` (monthly_allocator.py, even monthly coverage), `max_efficiency_reinvest` (simulator.py, month-by-month reinvestment simulation with event timeline). |
 | `engine/schemas/*.py` | Pydantic HTTP-shaped contracts (`BondInput`/`BondResponse`, `EngineRequest`/`EngineResponse`, `PositionCreate/Response`, `ReceivedPaymentCreate/Response`) — a parallel, unused-by-MCP path for a hypothetical future HTTP API. `server.py`'s tools bypass this entirely (see `market_bridge.py`). |
@@ -185,6 +210,24 @@ model/schemas if a real discrepancy ever needs logging instead — nothing curre
   would make a "compare as broker X" result misleadingly plausible rather than merely
   imprecise. Verified against real data: broker-filtered runs now produce different prices
   per broker and correctly drop candidates that specific broker doesn't carry.
+  (`server.py`'s own `compare_bonds` tool docstring had independently drifted stale — it
+  still claimed broker filtering wasn't honored — and has now been corrected to match.)
+- ~~`forecast_core._calculate_bond_forecast()` (used by `compare_bonds`) and
+  `finance.calculate_position_metrics()` (used by `position_metrics`/`portfolio_metrics`/
+  `simulate_reinvestment`) both double-counted НКД~~ **Fixed.** Both independently
+  mislabeled `bond.last_market_price`/`Bond.price_for_broker()` — which are always DIRTY
+  price per `domain/models.py`'s own contract — as "clean" and then added accrued interest
+  a second time, inflating the computed entry/market price and skewing every downstream
+  number built on it: `dirty_entry_price`/`actual_invested`/`ytm_to_maturity` in
+  `compare_bonds` (the `ytm_to_maturity` field was corrupted on *every* call, not just
+  hold-to-maturity ones — occasionally producing absurd negative YTMs on longer horizons),
+  and `market_value`/`unrealized_pnl`/`current_ytm` in `position_metrics`. Root cause was a
+  code bug, not schema ambiguity — `math_core.py`'s own `entry_price()`/`accrued_interest()`
+  already did this correctly and were just never called from these two modules. Both now
+  delegate to `math_core.entry_price()` instead of reimplementing the conversion (see that
+  module's docstring for the canonical explanation + call-site list). Verified against real
+  snapshot data: `dirty_entry_price`/`market_value` now match the raw scraped broker price
+  exactly (previously inflated by ~1x accrued interest).
 - `analytics_service._to_domain_bond` hardcodes `face_value=Decimal("1000")`, ignoring
   `BondInput.face_value` entirely. Harmless in practice (OVDP face value is always 1000 UAH)
   but means that schema field does nothing today. (Moot for anything MCP-driven — that path
@@ -228,12 +271,15 @@ model/schemas if a real discrepancy ever needs logging instead — nothing curre
 
 ## Known issues
 
-- **`scraper.py` still silently drops all console logging.** The `args.no_console` /
-  `args.no_console_logs` attribute-name crash is fixed, but `if not args.no_console_logs:`
-  compares a *string* (`"true"`/`"false"`, from `choices=[...]`) — both are truthy in Python,
-  so `not "false"` and `not "true"` are both `False`. The stderr handler is never added
-  regardless of the flag; only the file log (`--log-file`) gets anything. Not blocking, but
-  worth a one-line fix (`args.no_console_logs == "true"`) when next touching that code.
+- **`scraper.py` still silently drops all console logging by default** — same symptom as
+  before but the cause has moved: the string-truthiness crash (`if not args.no_console_logs:`,
+  always `False` for either `"true"`/`"false"`) is gone, replaced with
+  `if args.no_console_logs == "true":`, but the flag's *sense* is inverted for what its name
+  suggests — passing `--no-console-logs true` (i.e. asking to suppress console output) is what
+  currently ADDS the stderr handler, and the default `"false"` leaves it un-added, so a normal
+  run still produces no console output. Only the file log (`--log-file`) gets anything either
+  way. Not blocking, but worth a one-line fix (`args.no_console_logs != "true"`, or rename the
+  flag) when next touching that code.
 - **`plugin.json` intentionally has no `version` field.** Per Claude Code's docs: if a
   version is set (in `plugin.json` or the marketplace entry), users only get updates when
   that string is bumped — pushing commits alone does nothing. Left unset on purpose while

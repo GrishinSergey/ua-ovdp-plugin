@@ -1,5 +1,5 @@
 """
-OVDP multi-source scraper  →  bonds.json (v4)
+OVDP multi-source scraper  →  bonds.json (v5)
 
 SOURCE OF TRUTH = the BROKER (can you actually buy it), NOT ovdp.in.ua.
 ovdp.in.ua is treated purely as METADATA (schedule / name / yields) fetched per ISIN.
@@ -22,6 +22,30 @@ per-broker (where_to_buy[], never averaged). Displayed broker yields are kept pe
 NOT authoritative (engine recomputes YTM). Cross-source coupon/maturity/currency disagreement →
 output["warnings"].
 
+where_to_buy[] price fields (v5, additive — old snapshots lack these, readers must .get()
+them, never assume presence):
+  - price          — dirty price as quoted by the broker (unchanged since v4; kept as-is so
+                      every existing reader — market_bridge.py, server.py's best_price()/
+                      compute_ytm/sort_by — keeps working untouched).
+  - dirty_price     — same value as `price`, named explicitly so nothing has to be inferred
+                      from convention/docs alone (the whole point of this addition).
+  - nominal_price   — clean price (dirty_price - nkd_price), i.e. without accrued interest.
+  - nkd_price       — accrued interest (НКД) baked into dirty_price, computed independently
+                      from this bond's own coupon schedule (face_value × implied coupon_rate
+                      × days_since_last_coupon / 365 — same Actual/365 convention and
+                      coupon_rate derivation as engine/investment/forecast/math_core.py +
+                      engine/services/market_bridge.py; duplicated here rather than imported
+                      because scraper.py is a standalone script/subprocess and must stay
+                      dependency-free of engine/ — see compute_price_breakdown() below).
+  nominal_price and nkd_price are None when the bond has no past coupon yet to anchor "days
+  since last coupon" (freshly issued, first coupon still pending) — better to omit than guess.
+  These are a SNAPSHOT-TIME, informational best-effort split for humans/Claude reading raw
+  bond records directly; nothing in engine/ reads them — compute_ytm/compare_bonds/
+  position_metrics always re-derive clean/dirty from `price` at the actual settlement date
+  in use (which is virtually never exactly the scrape moment), via
+  engine.investment.forecast.math_core.entry_price(). Do not wire these fields into engine/
+  math without re-reading that module's docstring first.
+
 Observability: every fetch logs status/size/ms (DEBUG); per-item detail DEBUG; anomalies WARNING;
 reconcile + run summaries INFO; stage exceptions caught with context. --inzhur-dump saves raw
 Inzhur HTML so the text parser can be locked to the SSR payload if labels ever drift.
@@ -42,7 +66,7 @@ import re
 import sys
 import time
 import traceback
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
 
@@ -457,9 +481,62 @@ async def privat24_schedules(ctx: BrowserContext, isins: list[str],
 def _key(s: dict) -> tuple:
     return (s["date"], s["type"], round(s["amount"], 2))
 
+
+def _coupon_frequency(coupon_dates: list[str]) -> int:
+    """Payments/year inferred from the gap between the first two coupon dates.
+    Mirrors engine/investment/domain/models.py Bond.coupon_frequency — keep them in sync
+    if this heuristic ever changes (see compute_price_breakdown() docstring)."""
+    if len(coupon_dates) < 2:
+        return 2
+    d0 = datetime.strptime(coupon_dates[0], "%Y-%m-%d").date()
+    d1 = datetime.strptime(coupon_dates[1], "%Y-%m-%d").date()
+    gap = (d1 - d0).days
+    if gap <= 95:
+        return 4
+    if gap <= 185:
+        return 2
+    return 1
+
+
+def compute_price_breakdown(bond: dict, dirty_price: float, as_of: date) -> dict[str, float | None]:
+    """
+    Split a broker's dirty (as-quoted) price into clean (nominal_price) + accrued interest
+    (nkd_price), for display/cross-check purposes only — see the "where_to_buy[] price
+    fields (v5)" note in this module's docstring for who is (and, deliberately, is NOT)
+    meant to consume these.
+
+    Formula mirrors engine/investment/forecast/math_core.accrued_interest() exactly —
+    face_value(=NOMINAL) × implied_coupon_rate × days_since_last_coupon / 365, Actual/365 —
+    and derives implied_coupon_rate the same way engine/services/market_bridge.py does
+    (coupon_amount × coupon_frequency / face_value). Duplicated here rather than imported
+    from engine/ to keep this script dependency-free of it (engine/ is a downstream
+    consumer of scraper output, not a peer scraper.py should import from). If math_core.py's
+    formula ever changes, mirror the change here too.
+
+    Returns {"nominal_price": None, "nkd_price": None} if the bond hasn't paid a first
+    coupon yet (no past coupon date to anchor "days since last coupon") — omit rather than
+    guess from issue_year, which scraper.py only has as a bare year, not an exact date.
+    """
+    coupon_dates = sorted(
+        s["date"] for s in bond.get("schedule", []) if s["type"] == "купон"
+    )
+    past = [d for d in coupon_dates if d <= as_of.isoformat()]
+    coupon_amount = bond.get("coupon_amount")
+    if not past or not coupon_amount:
+        return {"nominal_price": None, "nkd_price": None}
+
+    last_coupon_date = datetime.strptime(max(past), "%Y-%m-%d").date()
+    days_accrued = (as_of - last_coupon_date).days
+    frequency = _coupon_frequency(coupon_dates)
+    coupon_rate = coupon_amount * frequency / NOMINAL
+
+    nkd = round(NOMINAL * coupon_rate * days_accrued / 365, 2)
+    return {"nominal_price": round(dirty_price - nkd, 2), "nkd_price": nkd}
+
+
 def reconcile(universe: list[str], ovdp: dict[str, dict], ovdp_px: dict[str, dict],
               inzhur: dict[str, dict], p24: dict[str, dict],
-              p24_sched: dict[str, list]) -> tuple[list[dict], list[str]]:
+              p24_sched: dict[str, list], as_of: date) -> tuple[list[dict], list[str]]:
     warnings: list[str] = []
     bonds: list[dict] = []
     n_meta = n_brokeronly = 0
@@ -512,15 +589,27 @@ def reconcile(universe: list[str], ovdp: dict[str, dict], ovdp_px: dict[str, dic
             if canon and _key(s) not in canon:
                 warnings.append(f"{isin}: Inzhur payment {s['date']} {s['amount']} not in ovdp schedule — check staleness")
 
-        # where_to_buy: prices ONLY from broker pages; Sense from ovdp column as enrichment
+        # where_to_buy: prices ONLY from broker pages; Sense from ovdp column as enrichment.
+        # price/dirty_price/nominal_price/nkd_price — see "where_to_buy[] price fields (v5)"
+        # in this module's docstring.
+        def _priced(broker: str, price: float, *, with_yield_key: bool = False,
+                    yield_pct: float | None = None) -> dict:
+            entry = {"broker": broker, "price": price, "dirty_price": price}
+            if with_yield_key:
+                entry["yield_pct"] = yield_pct
+            entry.update(compute_price_breakdown(bond, price, as_of))
+            return entry
+
         wtb: list[dict] = []
         if iz and iz.get("buy_price") is not None:
-            wtb.append({"broker": "Inzhur", "price": iz["buy_price"], "yield_pct": iz.get("yield_actual_pct")}); cov_iz += 1
+            wtb.append(_priced("Inzhur", iz["buy_price"], with_yield_key=True,
+                                yield_pct=iz.get("yield_actual_pct"))); cov_iz += 1
         if pv and pv.get("buy_price") is not None:
-            wtb.append({"broker": "Приват24", "price": pv["buy_price"], "yield_pct": pv.get("yield_actual_pct")}); cov_p24 += 1
+            wtb.append(_priced("Приват24", pv["buy_price"], with_yield_key=True,
+                                yield_pct=pv.get("yield_actual_pct"))); cov_p24 += 1
         if op:
             for w in op.get("extra_where", []):
-                wtb.append({"broker": w["broker"], "price": w["price"]})
+                wtb.append(_priced(w["broker"], w["price"]))
                 if w["broker"] == "Sense": cov_sense += 1
         bond["where_to_buy"] = wtb
         bonds.append(bond)
@@ -592,8 +681,12 @@ async def run(out_path: Path, headless: bool, timeout: int, isins_filter: list[s
 
         await ctx.close(); await browser.close()
 
-    bonds, warnings = reconcile(universe, ovdp, ovdp_px, inzhur, p24, p24_sched)
-    output = {"parsed_at": now_iso(),
+    # parsed_at fixed once here so nkd_price (computed "as of" this same instant inside
+    # reconcile()) can never drift from the timestamp the snapshot itself reports.
+    parsed_at = now_iso()
+    scrape_date = datetime.fromisoformat(parsed_at.replace("Z", "+00:00")).date()
+    bonds, warnings = reconcile(universe, ovdp, ovdp_px, inzhur, p24, p24_sched, scrape_date)
+    output = {"parsed_at": parsed_at,
               "sources": {"ovdp": PRICES_URL, "inzhur": INZHUR_URL, "privat24": P24_LIST},
               "total_bonds": len(bonds), "warnings": warnings, "bonds": bonds}
     out_path.parent.mkdir(parents=True, exist_ok=True)
@@ -609,7 +702,7 @@ async def run(out_path: Path, headless: bool, timeout: int, isins_filter: list[s
             logger.warning(f"    • {w}")
 
 def main() -> None:
-    ap = argparse.ArgumentParser(description="OVDP scraper (broker = source of truth) → bonds.json (v4)")
+    ap = argparse.ArgumentParser(description="OVDP scraper (broker = source of truth) → bonds.json (v5)")
     ap.add_argument("--out", "-o", default="bonds.json")
     ap.add_argument("--headless", default="true", choices=["true", "false"])
     ap.add_argument("--timeout", "-t", type=int, default=25)

@@ -15,6 +15,7 @@ from decimal import Decimal, ROUND_HALF_UP
 from typing import Optional
 
 from engine.investment.domain.models import Bond, Position, Portfolio
+from engine.investment.forecast.math_core import entry_price
 
 # ── Константи ────────────────────────────────────────────────────────────────
 
@@ -365,7 +366,11 @@ def calculate_position_metrics(
     current_ytm        = None
 
     if bond.last_market_price is not None and not is_matured:
-        dirty_market   = bond.last_market_price + ai.amount_per_bond
+        # entry_price() is the canonical dirty<->clean conversion (math_core.py) — do not
+        # add ai.amount_per_bond to bond.last_market_price here, it's already dirty
+        # (domain/models.py). That used to double-count NKD and inflate market_value/
+        # unrealized_pnl and skew current_ytm below.
+        dirty_market   = entry_price(bond, as_of).dirty_price
         market_value   = (dirty_market * qty).quantize(PRECISION)
         unrealized_pnl = (market_value - total_invested).quantize(PRECISION)
         unrealized_pnl_pct = round(
@@ -535,12 +540,32 @@ class ReinvestmentScenario:
     total_reinvestment_income: Decimal
     effective_annual_return: float
 
+    # Baseline (reinvest_rate=0: coupons held as cash, not reinvested) — isolates the
+    # portfolio's OWN return from the reinvestment assumption layered on top of it. See
+    # simulate_reinvestment()'s docstring for why this pair exists.
+    baseline_final_value: Decimal
+    baseline_effective_annual_return: float
+
 
 def simulate_reinvestment(
         pm: PortfolioMetrics,
         reinvest_rate: float = 0.15,
         years: int = 3,
 ) -> ReinvestmentScenario:
+    """
+    "What if I reinvest every coupon at reinvest_rate for `years`?" — projects the
+    current portfolio's coupons forward with compounding reinvestment.
+
+    effective_annual_return blends two distinct things: the return the CURRENT bonds
+    themselves already generate (coupons + maturities vs. what was invested) and the
+    EXTRA growth from the reinvest_rate assumption on top. A single number here can't be
+    read as "how good is this portfolio" — a portfolio full of near-maturity bonds with a
+    high reinvest_rate assumption looks similar to a strong long-duration portfolio with a
+    conservative one. baseline_effective_annual_return isolates the first part (computed
+    with reinvest_rate=0, i.e. coupons just held as cash) so the two are comparable
+    side by side; the reinvestment assumption's own contribution is
+    total_reinvestment_income (= final_value - baseline_final_value exactly).
+    """
     as_of   = pm.as_of
     horizon = date(as_of.year + years, as_of.month, as_of.day)
 
@@ -562,14 +587,14 @@ def simulate_reinvestment(
         if cf.kind == "maturity" and cf.payment_date <= horizon
     )
 
-    final_value = (total_coupons + reinvestment_income + maturities).quantize(PRECISION)
-    invested    = pm.total_invested
+    final_value          = (total_coupons + reinvestment_income + maturities).quantize(PRECISION)
+    baseline_final_value = (total_coupons + maturities).quantize(PRECISION)
+    invested             = pm.total_invested
 
-    effective_return = 0.0
-    if float(invested) > 0 and years > 0:
-        effective_return = round(
-            (float(final_value) / float(invested)) ** (1.0 / years) - 1, 6
-        )
+    def _cagr(value: Decimal) -> float:
+        if float(invested) <= 0 or years <= 0:
+            return 0.0
+        return round((float(value) / float(invested)) ** (1.0 / years) - 1, 6)
 
     return ReinvestmentScenario(
         reinvest_rate=reinvest_rate,
@@ -578,5 +603,7 @@ def simulate_reinvestment(
         final_value=final_value,
         total_coupons_received=total_coupons.quantize(PRECISION),
         total_reinvestment_income=reinvestment_income.quantize(PRECISION),
-        effective_annual_return=effective_return,
+        effective_annual_return=_cagr(final_value),
+        baseline_final_value=baseline_final_value,
+        baseline_effective_annual_return=_cagr(baseline_final_value),
     )

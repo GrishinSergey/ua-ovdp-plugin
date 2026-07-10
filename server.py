@@ -146,6 +146,65 @@ def _snapshot_meta(path: Path) -> dict[str, Any]:
     }
 
 
+# ══ data-quality warnings: default exclusion for list_bonds/compare_bonds/
+#    build_target_portfolio ═══════════════════════════════════════════════════
+
+# Warning categories that mean this bond's OWN computed numbers (price, YTM, NKD) would
+# be actively wrong, not just incomplete — a cross-source disagreement between ovdp and a
+# broker page for the SAME bond. Anything else (broker-only bonds with no ovdp metadata,
+# a stale Inzhur payment not yet reflected in ovdp's schedule) is informational only and
+# doesn't disqualify the bond. Keep this in sync with reconcile()'s own warning-category
+# labels in scraper.py (the "── reconcile summary ──" log line) if those text markers
+# ever change — they're matched by substring, not a structured field, because scraper.py's
+# warnings are (and are meant to stay) plain human-readable strings.
+_DATA_WARNING_REMOVE_MARKERS = ("currency mismatch", "maturity mismatch", "coupon mismatch")
+
+
+def _categorize_warnings(raw_warnings: list[str]) -> dict[str, list[dict[str, str]]]:
+    """
+    Groups scraper warnings (format "<ISIN>: <message>", see reconcile() in scraper.py) by
+    ISIN and tags each one:
+      - "прибрано"   — this ISIN is dropped from list_bonds/compare_bonds/
+                        build_target_portfolio's default results. Triggered by ANY warning
+                        matching _DATA_WARNING_REMOVE_MARKERS; once triggered, ALL of that
+                        ISIN's warnings (even otherwise-informational ones) are tagged
+                        "прибрано" too, since none of them will be visible in the filtered
+                        results anyway.
+      - "неприбрано" — informational only, the bond stays in results.
+
+    Single source of truth for this decision — used inline by list_bonds and via
+    _load_engine_bonds by compare_bonds/build_target_portfolio, so "should this bond be
+    excluded" is never answered two different ways in two different tools.
+    """
+    by_isin: dict[str, list[str]] = {}
+    for w in raw_warnings:
+        isin, sep, _rest = w.partition(": ")
+        if sep:
+            by_isin.setdefault(isin, []).append(w)
+
+    out: dict[str, list[dict[str, str]]] = {}
+    for isin, ws in by_isin.items():
+        removed = any(marker in w for w in ws for marker in _DATA_WARNING_REMOVE_MARKERS)
+        status = "прибрано" if removed else "неприбрано"
+        out[isin] = [{"message": w, "status": status} for w in ws]
+    return out
+
+
+def _data_warnings_for(
+        warnings_by_isin: dict[str, list[dict[str, str]]],
+        isins: Optional[list[str]],
+) -> list[dict[str, str]]:
+    """Flattens _categorize_warnings' per-ISIN breakdown into a flat list, scoped to
+    `isins` if given (e.g. compare_bonds' candidate list) or every warned ISIN in the
+    snapshot otherwise (list_bonds / build_target_portfolio with no isins filter)."""
+    keys = isins if isins else list(warnings_by_isin.keys())
+    return [
+        {"isin": isin, **w}
+        for isin in keys
+        for w in warnings_by_isin.get(isin, [])
+    ]
+
+
 # ══ engine/ bridging (position tracking, forecasting, portfolio construction) ═══════
 
 def _load_engine_bond(isin: str, path: Path) -> Optional[Any]:
@@ -156,14 +215,31 @@ def _load_engine_bond(isin: str, path: Path) -> Optional[Any]:
     return bond_from_snapshot(raw) if raw is not None else None
 
 
-def _load_engine_bonds(path: Path, isins: Optional[list[str]] = None) -> dict[str, Any]:
-    """All (or a filtered subset of) bonds in a snapshot, converted to engine Bonds."""
+def _load_engine_bonds(
+        path: Path, isins: Optional[list[str]] = None,
+) -> tuple[dict[str, Any], dict[str, list[dict[str, str]]]]:
+    """All (or a filtered subset of) bonds in a snapshot, converted to engine Bonds —
+    EXCLUDING any ISIN tagged "прибрано" by _categorize_warnings (a cross-source data
+    mismatch that would make the bond's own numbers actively wrong). Used by compare_bonds
+    and build_target_portfolio so a bad data point can't quietly corrupt a ranking, and by
+    _compute_portfolio_metrics for live-price enrichment (an owned position with a
+    disqualified ISIN still shows its frozen/recorded data — it just skips live repricing).
+
+    Returns (bonds, warnings_by_isin) — the second element is the FULL per-ISIN warning
+    breakdown (including "неприбрано" ones), for the caller to surface via
+    _data_warnings_for(); not just which ISINs got dropped."""
     data = _load_bonds_file(path)
-    return {
+    warnings_by_isin = _categorize_warnings(data.get("warnings", []))
+    excluded = {
+        isin for isin, ws in warnings_by_isin.items()
+        if any(w["status"] == "прибрано" for w in ws)
+    }
+    bonds = {
         b["isin"]: bond_from_snapshot(b)
         for b in data["bonds"]
-        if not isins or b["isin"] in isins
+        if (not isins or b["isin"] in isins) and b["isin"] not in excluded
     }
+    return bonds, warnings_by_isin
 
 
 def _compute_portfolio_metrics(as_of: date, label: Optional[str], data_path: Optional[str]):
@@ -178,7 +254,7 @@ def _compute_portfolio_metrics(as_of: date, label: Optional[str], data_path: Opt
         raise ValueError("no positions recorded yet — call add_position() first")
 
     try:
-        live_bonds = _load_engine_bonds(_resolve_path(data_path))
+        live_bonds, _ = _load_engine_bonds(_resolve_path(data_path))
     except FileNotFoundError:
         live_bonds = {}
 
@@ -412,11 +488,21 @@ def list_bonds(
         data_path: read a specific snapshot file instead of the latest one
             in the market dir (default is the newest snapshot).
 
-    Returns {count, total_in_source, parsed_at, snapshot_file, snapshot_taken_at, bonds}.
+    Bonds with a currency/maturity/coupon mismatch between ovdp and a broker page (data
+    that would make THIS bond's own numbers actively wrong, not just incomplete) are
+    excluded by default — they don't count towards `count`, but every one of their
+    warnings is still listed in `data_warnings` (status "прибрано") so nothing silently
+    disappears without an explanation. Informational-only warnings (broker-only bonds,
+    stale Inzhur payments) don't exclude the bond — status "неприбрано", bond stays in
+    `bonds`. No separate get_warnings() call needed to check this before using the list.
+
+    Returns {count, total_in_source, parsed_at, snapshot_file, snapshot_taken_at,
+    data_warnings, bonds}.
     """
     path = _resolve_path(data_path)
     data = _load_bonds_file(path)
     bonds = data["bonds"]
+    warnings_by_isin = _categorize_warnings(data.get("warnings", []))
 
     def best_price(b: dict) -> float:
         prices = [w["price"] for w in b.get("where_to_buy", []) if w.get("price") is not None]
@@ -424,6 +510,9 @@ def list_bonds(
 
     out = []
     for b in bonds:
+        isin_warnings = warnings_by_isin.get(b["isin"], [])
+        if any(w["status"] == "прибрано" for w in isin_warnings):
+            continue
         if currency and b.get("currency") != currency:
             continue
         if is_military is not None and b.get("is_military") != is_military:
@@ -461,6 +550,7 @@ def list_bonds(
         "total_in_source": len(bonds),
         "parsed_at": data.get("parsed_at"),
         **_snapshot_meta(path),
+        "data_warnings": _data_warnings_for(warnings_by_isin, None),
         "bonds": out,
     }
 
@@ -863,8 +953,16 @@ def simulate_reinvestment(
 ) -> dict[str, Any]:
     """
     "What if I reinvest every coupon at reinvest_rate for `years`?" — projects your
-    current portfolio's coupons forward with compounding reinvestment, returning the
-    final value and effective annualized return.
+    current portfolio's coupons forward with compounding reinvestment.
+
+    Returns both effective_annual_return (final_value including the reinvest_rate
+    assumption) AND baseline_effective_annual_return (same projection with reinvest_rate=0,
+    coupons just held as cash) — don't read effective_annual_return alone as "how good is
+    this portfolio": it blends the portfolio's own return with the extra growth from the
+    reinvest_rate assumption layered on top, and two very different portfolios can produce
+    a similar blended number. Compare the baseline pair for the portfolio's own quality;
+    the gap between final_value and baseline_final_value (= total_reinvestment_income) is
+    what the reinvestment assumption itself is contributing.
     """
     as_of_date = date.fromisoformat(as_of) if as_of else date.today()
     try:
@@ -901,20 +999,29 @@ def compare_bonds(
         compare_by_full_period: hold each bond to ITS OWN maturity instead of a shared
             horizon (so results aren't directly comparable period-for-period, but each
             reflects that bond's true full-life return).
-        broker: informational only — NOTE: forecast_core's own math currently prices
-            every candidate off Bond.last_market_price (cheapest available), not a
-            broker-specific price, regardless of this parameter. Kept for parity with the
-            engine's own signature; doesn't yet filter/select price by broker.
+        broker: restrict candidates to this broker's offer. Any bond this broker doesn't
+            actually carry is excluded (with a warning) rather than silently repriced from
+            a different broker — mixing broker-X price for one candidate with a fallback
+            price for another would make a "compare as broker X" result misleadingly
+            plausible instead of merely imprecise. The remaining candidates are priced via
+            Bond.price_for_broker(broker), not the cheapest-available fallback.
         strategy: "standard" (dirty-price basis, financially correct) or "приват24"/
             "privat24" (clean-price basis, matches Privat24's own displayed numbers).
         data_path: use this snapshot instead of the latest one.
 
+    Any requested ISIN with a currency/maturity/coupon mismatch between ovdp and a broker
+    page (data that would make ITS OWN numbers actively wrong) is dropped from the
+    candidate pool before ranking — it shows up in missing_isins, and data_warnings
+    explains why. No separate get_warnings() call needed before ranking.
+
     Returns ranked BondForecastItem list + any data-quality warnings (e.g. a candidate
-    excluded for having no market price).
+    excluded for having no market price) + data_warnings (the currency/maturity/coupon
+    mismatch reasons, if any of the requested isins were dropped for that).
     """
     path = _resolve_path(data_path)
-    bonds_by_isin = _load_engine_bonds(path, isins=isins)
+    bonds_by_isin, warnings_by_isin = _load_engine_bonds(path, isins=isins)
     missing = [i for i in isins if i not in bonds_by_isin]
+    data_warnings = _data_warnings_for(warnings_by_isin, isins)
 
     try:
         strat = get_strategy(strategy)
@@ -929,9 +1036,11 @@ def compare_bonds(
             broker=broker, strategy=strat,
         )
     except ValueError as e:
-        return {"error": str(e), "missing_isins": missing, **_snapshot_meta(path)}
+        return {"error": str(e), "missing_isins": missing, "data_warnings": data_warnings,
+                **_snapshot_meta(path)}
 
-    return {**to_jsonable(result), "missing_isins": missing, **_snapshot_meta(path)}
+    return {**to_jsonable(result), "missing_isins": missing, "data_warnings": data_warnings,
+            **_snapshot_meta(path)}
 
 
 @mcp.tool()
@@ -961,19 +1070,26 @@ def build_target_portfolio(
           - "max_efficiency_reinvest": simulate reinvesting coupons/maturities back into
             the best available bond each month — a fuller month-by-month projection
             with an event timeline.
-        broker: restrict pricing to this broker's offer (properly honored here, unlike
-            compare_bonds — build_portfolio's underlying math uses Bond.price_for_broker).
+        broker: restrict pricing to this broker's offer — build_portfolio's underlying
+            math uses Bond.price_for_broker.
         data_path: use this snapshot instead of the latest one.
+
+    Any candidate with a currency/maturity/coupon mismatch between ovdp and a broker page
+    (data that would make ITS OWN numbers actively wrong) is excluded from the candidate
+    pool before allocation — see data_warnings in the response for why.
 
     Returns the allocation (which bonds, how many units each) + whether target_income
     was actually reachable + any warnings (e.g. candidates excluded for no coupons in
-    the horizon).
+    the horizon) + data_warnings (candidates dropped for a currency/maturity/coupon
+    mismatch, if any).
     """
     path = _resolve_path(data_path)
-    bonds_by_isin = _load_engine_bonds(path, isins=isins)
+    bonds_by_isin, warnings_by_isin = _load_engine_bonds(path, isins=isins)
+    data_warnings = _data_warnings_for(warnings_by_isin, isins)
     if not bonds_by_isin:
         return {
             "error": "no resolvable bonds found — check isins, or that the snapshot isn't empty",
+            "data_warnings": data_warnings,
             **_snapshot_meta(path),
         }
 
@@ -988,9 +1104,9 @@ def build_target_portfolio(
     try:
         result = build_portfolio(req)
     except ValueError as e:
-        return {"error": str(e), **_snapshot_meta(path)}
+        return {"error": str(e), "data_warnings": data_warnings, **_snapshot_meta(path)}
 
-    return {**to_jsonable(result), **_snapshot_meta(path)}
+    return {**to_jsonable(result), "data_warnings": data_warnings, **_snapshot_meta(path)}
 
 
 def main() -> None:

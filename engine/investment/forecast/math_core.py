@@ -18,6 +18,33 @@ Day count convention: Actual/365 (методологія НБУ для ОВДП)
     3. investment_cost per unit = dirty_price (реальні витрати інвестора)
     4. real_income = coupons_in_horizon - accrued_interest_paid
     5. efficiency = real_income / investment_cost  (НЕ coupon_rate)
+
+── КАНОНІЧНА реалізація dirty/clean/НКД — не дублювати ─────────────────────
+
+accrued_interest() і entry_price() (нижче) — ЄДИНЕ місце в кодовій базі, де
+dirty price конвертується в clean price (і навпаки). Bond.last_market_price
+та BrokerPrice.price ЗАВЖДИ dirty (див. domain/models.py) — це вже вирване
+з двозначності на рівні даних, помилка тут завжди в коді, не в даних.
+
+Раніше forecast_core.py і finance.py незалежно одне від одного РЕІМПЛЕМЕНТУВАЛИ
+цю конвертацію — і обидва зробили одну й ту саму помилку: трактували вже-dirty
+bond.last_market_price/price_for_broker() як "clean" і додавали accrued_interest
+ще раз (подвійний облік НКД → занижений actual_invested/дохід, завищена ціна
+входу, помітно в ytm_to_maturity в compare_bonds і current_ytm/unrealized_pnl
+в position_metrics). Обидва тепер викликають entry_price() з цього модуля
+замість власної арифметики — саме так і мають чинити майбутні виклики:
+
+    from engine.investment.forecast.math_core import entry_price
+    ep = entry_price(bond, settlement_date, broker)   # broker=None -> last_market_price
+    ep.dirty_price     # те, що реально платиш зараз
+    ep.clean_price      # dirty - НКД
+    ep.accrued_interest  # НКД компонент
+
+Якщо колись знадобиться ще одне місце, що рахує dirty↔clean — використовуй
+entry_price()/accrued_interest() звідси, а не пиши `price + accrued_interest`
+чи `price - accrued_interest` руками. Якщо broker-конвенція колись зміниться
+(наприклад, якийсь новий брокер почне віддавати clean price замість dirty),
+міняти доведеться тільки тут.
 """
 
 from __future__ import annotations
@@ -107,6 +134,11 @@ def accrued_interest(bond: Bond, settlement_date: date) -> AccruedInterest:
         - settlement_date == coupon_date → НКД = 0
         - settlement_date до першого купону → last_coupon_date = issue_date
         - settlement_date після всіх купонів → облігація погашена / невалідна
+
+    Використовується напряму portfolio_service-стороною через entry_price() нижче
+    (компонент .accrued_interest) — окремо викликати варто лише коли потрібне ЧИСТЕ
+    НКД без ціни (наприклад monthly_cashflow_vector нижче). Для "скільки коштує
+    зайти в позицію" — завжди entry_price(), не ця функція окремо.
     """
     if settlement_date >= bond.maturity_date:
         return AccruedInterest(
@@ -149,6 +181,17 @@ def entry_price(bond: Bond, settlement_date: date, broker: Optional[str] = None)
         1. broker (якщо вказано і є в broker_prices)
         2. last_market_price
         3. face_value (fallback)
+
+    Канонічна крапка входу для будь-якого dirty↔clean перетворення в кодовій базі
+    (див. попередження на початку файлу). Використовується з:
+        - forecast_core._calculate_bond_forecast() (compare_bonds) — вхідна ціна
+          позиції та прогноз ціни продажу на горизонті.
+        - finance.calculate_position_metrics() (position_metrics/portfolio_metrics/
+          simulate_reinvestment) — поточна ринкова dirty-ціна відкритої позиції.
+        - portfolio/optimizer.py, monthly_allocator.py, simulator.py (build_target_portfolio)
+          — через bond_horizon_result()/real_income() нижче, які вже викликають цю функцію.
+    Якщо додаєш новий код, що рахує "скільки коштує зайти в облігацію зараз" —
+    виклич цю функцію, не пиши формулу заново.
     """
     dirty: Decimal
 
