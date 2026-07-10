@@ -23,6 +23,16 @@ from engine.investment.domain.models import Bond
 
 _PRECISION = PRECISION
 
+# (1 + effective_return_for_horizon) ** (365 / horizon_days) amplifies even a tiny,
+# economically meaningless return by an enormous exponent as horizon_days shrinks
+# (exponent = 365 at 1 day, 52 at 7 days) -- a real ~0.1-1% total return over a few days
+# blows up to hundreds/thousands of percent annualized (observed: ~5839% for a 1-day
+# holding period). Below this threshold, effective_annual_return is omitted (None) rather
+# than reporting a number nobody should act on; effective_return_for_horizon (the
+# non-annualized total return) stays populated regardless. No threshold here is fully
+# "safe" -- this just kills the reported degenerate case; adjust if 7 proves wrong.
+MIN_HORIZON_DAYS_FOR_ANNUALIZATION = 7
+
 
 # ── Result dataclasses ────────────────────────────────────────────────────────
 
@@ -43,7 +53,7 @@ class BondForecastItem:
     total_profit: Decimal
     total_profit_per_bond: Decimal
     effective_return_for_horizon: float
-    effective_annual_return: float
+    effective_annual_return: Optional[float]
     ytm_to_maturity: Optional[float]
     strategy_name: str = "Standard"
     rank: int = 0
@@ -204,7 +214,15 @@ def compare_bonds(
         )
 
     forecast_items.sort(
-        key=lambda x: (x.effective_annual_return, -float(x.actual_invested)),
+        # None (horizon too short to annualize -- see MIN_HORIZON_DAYS_FOR_ANNUALIZATION)
+        # sorts to the bottom: there's no fair fallback ranking signal for a return that
+        # can't be meaningfully annualized (total-period returns aren't comparable across
+        # bonds with different horizon lengths), so burying it is safer than surfacing a
+        # fabricated number prominently.
+        key=lambda x: (
+            x.effective_annual_return if x.effective_annual_return is not None else float("-inf"),
+            -float(x.actual_invested),
+        ),
         reverse=True,
     )
     for rank, item in enumerate(forecast_items, start=1):
@@ -317,9 +335,18 @@ def _calculate_bond_forecast(
         float(total_profit) / float(actual_invested), 6
     )
 
-    effective_annual_return = round(
-        (1.0 + effective_return_for_horizon) ** (365.0 / horizon_days) - 1.0, 6
-    )
+    effective_annual_return: Optional[float]
+    if horizon_days < MIN_HORIZON_DAYS_FOR_ANNUALIZATION:
+        effective_annual_return = None
+        warnings.append(
+            f"{bond.isin}: горизонт {horizon_days} дн. — занадто короткий для річної "
+            f"ануалізації (< {MIN_HORIZON_DAYS_FOR_ANNUALIZATION} дн.); "
+            f"effective_annual_return не розраховано."
+        )
+    else:
+        effective_annual_return = round(
+            (1.0 + effective_return_for_horizon) ** (365.0 / horizon_days) - 1.0, 6
+        )
 
     ytm_to_maturity = calculate_ytm(
         dirty_price_per_bond=float(dirty_price),

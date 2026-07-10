@@ -10,8 +10,8 @@ A working, installable Claude Code plugin, pushed to
 [GrishinSergey/ua-ovdp-plugin](https://github.com/GrishinSergey/ua-ovdp-plugin) (`master`):
 
 - `.claude-plugin/plugin.json` — plugin manifest (name `ua-ovdp-plugin`), now carrying a
-  semver `version` (first tagged release: `1.0.1`, git tag `v1.0.1`) — see "Versioning &
-  pinning" below for what this field does and doesn't do.
+  semver `version` (current: `1.0.2`, git tag `v1.0.2`; first tagged release was `1.0.1`)
+  — see "Versioning & pinning" below for what this field does and doesn't do.
 - `.claude-plugin/marketplace.json` — makes this repo installable as its own single-plugin
   marketplace (`source: "./"`, same repo). Without this file the plugin is NOT installable
   from GitHub at all — `claude plugin install` requires a marketplace-registered plugin.
@@ -55,7 +55,7 @@ conflate them:
 - **Pinning to a specific released version from another project** is done at the
   *marketplace-add* step, via a git ref/tag — not via the `version` string:
   ```
-  claude plugin marketplace add GrishinSergey/ua-ovdp-plugin#v1.0.1
+  claude plugin marketplace add GrishinSergey/ua-ovdp-plugin#v1.0.2
   ```
   or, in that project's `.claude/settings.json`:
   ```json
@@ -64,7 +64,7 @@ conflate them:
       "source": {
         "source": "github",
         "repo": "GrishinSergey/ua-ovdp-plugin",
-        "ref": "v1.0.1"
+        "ref": "v1.0.2"
       }
     }
   }
@@ -135,12 +135,17 @@ offer is not emitted at all, even if ovdp knows about it.
   settlement date in use via `math_core.entry_price()`, deliberately, not as a stopgap:
   a stored `nominal_price` is only valid exactly at `snapshot_taken_at`, every real call
   uses a *different* settlement date (today, a backdated purchase, a future horizon), and
-  `entry_price()` is pure Decimal arithmetic (no I/O) — there's no staleness risk or
-  performance reason to prefer a cached field over recomputing, and trusting two
-  independently-updatable numbers (a stored one + a freshly computed one) instead of
-  deriving one from the other is exactly the kind of divergence that caused the
-  double-NKD bug below in the first place. No `commission_price` field yet — deferred
-  pending an independent reference/fair-value price, see Known limitations.
+  `entry_price()` is pure Decimal arithmetic (no I/O) — no performance reason to prefer a
+  cached field over recomputing, and trusting two independently-updatable numbers (a stored
+  one + a freshly computed one) instead of deriving one from the other is exactly the kind
+  of divergence that caused the double-NKD bug below in the first place. (Caveat this
+  argument didn't originally account for: recomputing "fresh" is only correct if the
+  recomputation itself actually accounts for how far `settlement_date` has drifted from
+  the snapshot's own quote date — `entry_price()` didn't, until the stale-price-projection
+  fix documented below; it now carries a `Bond.price_quote_date` anchor specifically so
+  "recompute fresh" is a real guarantee, not just an assumption.) No `commission_price`
+  field yet — deferred pending an independent reference/fair-value price, see Known
+  limitations.
 
 ### Runtime data directories
 
@@ -267,6 +272,43 @@ model/schemas if a real discrepancy ever needs logging instead — nothing curre
   module's docstring for the canonical explanation + call-site list). Verified against real
   snapshot data: `dirty_entry_price`/`market_value` now match the raw scraped broker price
   exactly (previously inflated by ~1x accrued interest).
+- ~~`math_core.entry_price()` ignored how far `settlement_date` had drifted from the price's
+  actual quote date~~ **Fixed.** A different bug from the double-NKD one above (that was
+  same-date double counting; this was cross-date staleness), found in the same function —
+  `entry_price()` returned `bond.last_market_price`/`Bond.price_for_broker()` completely
+  unprojected regardless of `settlement_date`, while `accrued_interest_per_bond` (a
+  separate field) *did* correctly move with the date, so the two silently drifted apart.
+  Affected `compare_bonds` (`dirty_entry_price` frozen, `ytm_to_maturity`/
+  `effective_annual_return` swinging non-monotonically for any `as_of` away from the
+  snapshot date — reproduced: 15.5%→24.5%→15.5%→17.2%→25.0%→15.6%→46.5% across `as_of`
+  values months apart, same bond, fixed price the whole time), `position_metrics`/
+  `portfolio_metrics` (`market_value`/`unrealized_pnl`/`current_ytm` for any `as_of` away
+  from the snapshot date), and `build_target_portfolio` in all three modes (traced through
+  `optimizer.py`/`monthly_allocator.py`, both call `bond_horizon_result()` → `entry_price()`
+  directly with the caller's `settlement_date`). Not affected: `max_efficiency_reinvest`'s
+  month-by-month reinvestment-target selection (`simulator.py`'s `_find_best_bond()`) — it
+  has its own separate, pre-existing logic that prices future reinvestment targets at par
+  value rather than calling `entry_price()` at all; a different design choice, untouched by
+  this fix. `Bond` gained a `price_quote_date` field (set from the snapshot's `parsed_at` by
+  `market_bridge.snapshot_quote_date()`/`bond_from_snapshot()`, and re-set from the live
+  snapshot on position live-repricing in `position_from_record()`); `entry_price()` now
+  anchors a stable clean price at `price_quote_date` and re-derives dirty price at
+  `settlement_date` instead of returning the raw scraped number. Falls back to today's
+  exact (pre-fix) behavior whenever `price_quote_date` is unset (hand-built `Bond`s,
+  `analytics_service._to_domain_bond`'s HTTP path) or the price is the bare `face_value`
+  fallback — provably a no-op for the `settlement_date == quote date` case that every prior
+  test/smoke-check happened to use, which is why the double-NKD fix's own verification
+  didn't catch this. Verified against real snapshot data: the *implied clean price*
+  (`dirty_entry_price - accrued_interest_per_bond`) is now held exactly constant across
+  every `as_of`, where it previously wasn't defined at all (price was just frozen).
+  Alongside this, `compare_bonds`'s `effective_annual_return` also had an unguarded
+  `(1+r)**(365/horizon_days)` blow-up for very short horizons (reported case: ~5839%
+  annualized for a ~1-day holding period) — now `None` (with a warning) below
+  `MIN_HORIZON_DAYS_FOR_ANNUALIZATION = 7` days in `forecast_core.py`, ranked last rather
+  than sorted by a fabricated number; `effective_return_for_horizon` (non-annualized) stays
+  populated regardless. `compute_ytm` (`server.py`'s own standalone bisection solver) has a
+  structurally similar staleness gap in spirit but was left out of scope — see its own bullet
+  below.
 - `analytics_service._to_domain_bond` hardcodes `face_value=Decimal("1000")`, ignoring
   `BondInput.face_value` entirely. Harmless in practice (OVDP face value is always 1000 UAH)
   but means that schema field does nothing today. (Moot for anything MCP-driven — that path
@@ -276,7 +318,13 @@ model/schemas if a real discrepancy ever needs logging instead — nothing curre
   (`scipy.brentq`, used internally by `position_metrics`/`compare_bonds`/etc.) are two
   separate implementations of the same math, kept deliberately: different call sites
   (quick hypothetical lookup vs. actual position/comparison math), not true duplication
-  anymore now that both are in active use.
+  anymore now that both are in active use. `compute_ytm`'s `price`/`settlement_date` handling
+  never goes through `math_core.entry_price()` at all — it discounts whatever price it's
+  given directly from `settlement_date` with no clean/dirty reprojection, so it likely shares
+  the *spirit* of the stale-price bug fixed above for any `settlement_date` far from today
+  (not independently verified — the bug report that led to that fix never tested
+  `compute_ytm`). Deliberately left unfixed for now: flagging so the registry stays
+  accurate about what is and isn't covered, not because it's been ruled out.
 - `pyproject.toml` has no package config for `engine/` (no `[build-system]`/packages list) —
   not needed today: `server.py` runs as a plain script, and Python auto-adds its own directory
   to `sys.path`, so `engine/` is importable as a sibling package for free (verified: `engine.*`

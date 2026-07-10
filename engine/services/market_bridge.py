@@ -10,7 +10,7 @@ own _to_domain_bond, which converts the HTTP-shaped BondInput rather than touchi
 
 from __future__ import annotations
 
-from datetime import date
+from datetime import date, datetime
 from decimal import Decimal
 from typing import Any, Optional
 
@@ -19,7 +19,25 @@ from engine.investment.domain.models import Bond, BrokerPrice, CouponPayment, Po
 FACE_VALUE = Decimal("1000")  # OVDP nominal is always 1000 UAH/USD/EUR
 
 
-def bond_from_snapshot(bond_dict: dict[str, Any]) -> Bond:
+def snapshot_quote_date(data: dict[str, Any]) -> Optional[date]:
+    """Calendar date (UTC) a market_history snapshot's broker prices were actually quoted
+    at, from its top-level parsed_at — mirrors scraper.py's own parsed_at -> scrape_date
+    derivation (used there to compute where_to_buy[]'s nominal_price/nkd_price). Feed this
+    into bond_from_snapshot()'s quote_date so math_core.entry_price() can correctly project
+    a price to a settlement_date other than the scrape date, instead of returning it
+    unmodified. Returns None on a missing/malformed parsed_at (old snapshot format,
+    hand-edited file) rather than raising — Bond.price_quote_date staying None just means
+    entry_price() degrades to its pre-projection behavior for that bond, not an error."""
+    raw = data.get("parsed_at")
+    if not raw:
+        return None
+    try:
+        return datetime.fromisoformat(raw.replace("Z", "+00:00")).date()
+    except ValueError:
+        return None
+
+
+def bond_from_snapshot(bond_dict: dict[str, Any], quote_date: Optional[date] = None) -> Bond:
     """
     Convert one bond record from a scraper market_history snapshot into a domain Bond.
 
@@ -31,6 +49,12 @@ def bond_from_snapshot(bond_dict: dict[str, Any]) -> Bond:
         annualized rate BondInput expects -> derived as coupon_amount * frequency / face_value,
         using Bond.coupon_frequency (itself inferred from the gap between the first two
         scheduled coupon dates).
+
+    quote_date: the snapshot's own scrape date (get it from snapshot_quote_date() on the
+    same snapshot dict this bond_dict came from) -> Bond.price_quote_date, so
+    math_core.entry_price() knows how to project last_market_price/broker_prices forward
+    or backward to an arbitrary settlement_date instead of treating them as valid exactly
+    at settlement_date. Omit only when the caller genuinely has no snapshot context.
     """
     coupon_schedule = [
         CouponPayment(
@@ -69,6 +93,7 @@ def bond_from_snapshot(bond_dict: dict[str, Any]) -> Bond:
     bond.broker_prices = broker_prices
     if broker_prices:
         bond.last_market_price = min(bp.price for bp in broker_prices)
+    bond.price_quote_date = quote_date
 
     return bond
 
@@ -115,6 +140,7 @@ def position_from_record(
         record: dict[str, Any],
         as_of: date,
         live_price: Optional[Decimal] = None,
+        live_price_quote_date: Optional[date] = None,
 ) -> Position:
     """
     Persisted position record -> domain Position, ready for calculate_position_metrics.
@@ -125,10 +151,17 @@ def position_from_record(
     for OVDP specifically (state-guaranteed, effectively never actually deviates from
     schedule) traded for zero manual logging. If real payments ever diverge from schedule,
     this is the function to revisit.
+
+    live_price_quote_date: pass the live snapshot's own quote date (e.g. the
+    Bond.price_quote_date of the same live-snapshot Bond live_price was read off) alongside
+    live_price -- bond_from_frozen() below never sets price_quote_date (frozen bonds carry
+    no price info at all until this live-repricing step), so without this the live_price
+    injected here would have no anchor date for math_core.entry_price() to project from.
     """
     bond = bond_from_frozen(record["isin"], record["bond_snapshot"])
     if live_price is not None:
         bond.last_market_price = live_price
+        bond.price_quote_date = live_price_quote_date
 
     purchase_date = date.fromisoformat(record["purchase_date"])
     quantity = int(record["quantity"])

@@ -1,6 +1,6 @@
 {
   "name": "ua-ovdp-plugin",
-  "version": "1.0.1",
+  "version": "1.0.2",
   "description": "Query, analyze, and track Ukrainian government bonds (ОВДП) via ovdp.in.ua, Приват24, and Inzhur — real yields (XIRR), price history, data-quality warnings.",
   "author": {
     "name": "Serhii Hryshyn",

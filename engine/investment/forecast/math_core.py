@@ -172,7 +172,7 @@ def accrued_interest(bond: Bond, settlement_date: date) -> AccruedInterest:
 
 def entry_price(bond: Bond, settlement_date: date, broker: Optional[str] = None) -> EntryPrice:
     """
-    Розраховує ціну входу в позицію.
+    Розраховує ціну входу в позицію на дату settlement_date.
 
     BrokerPrice.price трактується як DIRTY price (як показує Приват24).
     clean_price витягується зворотньо: clean = dirty - НКД
@@ -181,6 +181,23 @@ def entry_price(bond: Bond, settlement_date: date, broker: Optional[str] = None)
         1. broker (якщо вказано і є в broker_prices)
         2. last_market_price
         3. face_value (fallback)
+
+    Ціна ПРОЄКТУЄТЬСЯ на settlement_date, а не повертається як є. last_market_price/
+    price_for_broker() відомі станом на bond.price_quote_date (дата скрейпу снепшоту, з
+    якого цей Bond побудовано) — це майже ніколи не той самий день, що settlement_date
+    (сьогодні, дата покупки заднім числом, майбутній горизонт). Тому: 1) знімаємо стабільну
+    clean-ціну на price_quote_date (dirty_at_quote - НКД(price_quote_date)), 2) відновлюємо
+    dirty на settlement_date (clean + НКД(settlement_date)). Раніше ця функція повертала
+    dirty_at_quote як є, незалежно від settlement_date — це давало ЗАМОРОЖЕНУ ціну входу,
+    тоді як accrued_interest окремо коректно рухався з settlement_date, і вони розходились
+    (дало абсурдні/немонотонні ytm_to_maturity в compare_bonds для settlement_date, віддаленого
+    від дати снепшоту).
+
+    Якщо price_quote_date невідома (Bond побудовано не зі снепшоту — hand-built,
+    analytics_service._to_domain_bond) АБО ціна — сам face_value fallback (немає реальної
+    котирувальної дати, яку можна прив'язати), quote_date прирівнюється до settlement_date:
+    НКД на обох кінцях тоді буквально той самий виклик з тими самими аргументами, і формула
+    звужується точно до dirty_at_quote — той самий результат, що й до цього фікса.
 
     Канонічна крапка входу для будь-якого dirty↔clean перетворення в кодовій базі
     (див. попередження на початку файлу). Використовується з:
@@ -193,20 +210,30 @@ def entry_price(bond: Bond, settlement_date: date, broker: Optional[str] = None)
     Якщо додаєш новий код, що рахує "скільки коштує зайти в облігацію зараз" —
     виклич цю функцію, не пиши формулу заново.
     """
-    dirty: Decimal
+    dirty_at_quote: Decimal
+    quoted: bool  # True лише якщо dirty_at_quote — реальна ринкова ціна, не face_value fallback
 
-    if broker:
-        bp = bond.price_for_broker(broker)
-        dirty = bp if bp is not None else (bond.last_market_price or bond.face_value)
+    if broker and (bp := bond.price_for_broker(broker)) is not None:
+        dirty_at_quote, quoted = bp, True
+    elif bond.last_market_price is not None:
+        dirty_at_quote, quoted = bond.last_market_price, True
     else:
-        dirty = bond.last_market_price or bond.face_value
+        dirty_at_quote, quoted = bond.face_value, False
 
-    ai = accrued_interest(bond, settlement_date)
-    clean = (dirty - ai.amount).quantize(PRECISION, rounding=ROUND_HALF_UP)
+    quote_date = (
+        bond.price_quote_date
+        if quoted and bond.price_quote_date is not None
+        else settlement_date
+    )
+
+    ai_quote = accrued_interest(bond, quote_date)
+    clean = (dirty_at_quote - ai_quote.amount).quantize(PRECISION, rounding=ROUND_HALF_UP)
+    ai_settlement = accrued_interest(bond, settlement_date)
+    dirty = (clean + ai_settlement.amount).quantize(PRECISION, rounding=ROUND_HALF_UP)
 
     return EntryPrice(
         dirty_price=dirty.quantize(OUT_PREC),
-        accrued_interest=ai.amount.quantize(OUT_PREC),
+        accrued_interest=ai_settlement.amount.quantize(OUT_PREC),
         clean_price=clean.quantize(OUT_PREC),
     )
 

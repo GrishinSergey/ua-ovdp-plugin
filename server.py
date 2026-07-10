@@ -64,7 +64,7 @@ from engine.investment.forecast.strategy import get_strategy
 from engine.investment.portfolio.engine import EngineRequest, build_portfolio
 from engine.serialize import to_jsonable
 from engine.services import portfolio_service
-from engine.services.market_bridge import bond_from_snapshot, freeze_bond, position_from_record
+from engine.services.market_bridge import bond_from_snapshot, freeze_bond, position_from_record, snapshot_quote_date
 
 
 # ══ configuration ═════════════════════════════════════════════════════════
@@ -212,7 +212,7 @@ def _load_engine_bond(isin: str, path: Path) -> Optional[Any]:
     snapshot (not: malformed — a genuine conversion error is a real bug and should raise)."""
     data = _load_bonds_file(path)
     raw = next((b for b in data["bonds"] if b["isin"] == isin), None)
-    return bond_from_snapshot(raw) if raw is not None else None
+    return bond_from_snapshot(raw, quote_date=snapshot_quote_date(data)) if raw is not None else None
 
 
 def _load_engine_bonds(
@@ -229,13 +229,14 @@ def _load_engine_bonds(
     breakdown (including "неприбрано" ones), for the caller to surface via
     _data_warnings_for(); not just which ISINs got dropped."""
     data = _load_bonds_file(path)
+    quote_date = snapshot_quote_date(data)
     warnings_by_isin = _categorize_warnings(data.get("warnings", []))
     excluded = {
         isin for isin, ws in warnings_by_isin.items()
         if any(w["status"] == "прибрано" for w in ws)
     }
     bonds = {
-        b["isin"]: bond_from_snapshot(b)
+        b["isin"]: bond_from_snapshot(b, quote_date=quote_date)
         for b in data["bonds"]
         if (not isins or b["isin"] in isins) and b["isin"] not in excluded
     }
@@ -262,6 +263,7 @@ def _compute_portfolio_metrics(as_of: date, label: Optional[str], data_path: Opt
         position_from_record(
             r, as_of,
             live_price=(live_bonds[r["isin"]].last_market_price if r["isin"] in live_bonds else None),
+            live_price_quote_date=(live_bonds[r["isin"]].price_quote_date if r["isin"] in live_bonds else None),
         )
         for r in records
     ]
@@ -914,12 +916,16 @@ def position_metrics(
         path = _resolve_path(data_path)
         live_bond = _load_engine_bond(record["isin"], path)
         live_price = live_bond.last_market_price if live_bond else None
+        live_price_quote_date = live_bond.price_quote_date if live_bond else None
         if live_bond is not None:
             live_meta = _snapshot_meta(path)
     except FileNotFoundError:
         live_price = None
+        live_price_quote_date = None
 
-    position = position_from_record(record, as_of_date, live_price=live_price)
+    position = position_from_record(
+        record, as_of_date, live_price=live_price, live_price_quote_date=live_price_quote_date,
+    )
     metrics = calculate_position_metrics(position, as_of_date)
     return {**to_jsonable(metrics), **live_meta}
 

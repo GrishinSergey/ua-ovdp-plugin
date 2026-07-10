@@ -62,6 +62,14 @@ class Bond:
     coupon_schedule: list[CouponPayment] = field(default_factory=list)
     last_market_price: Optional[Decimal] = None  # dirty price (загальна / за замовчуванням)
     broker_prices: list[BrokerPrice] = field(default_factory=list)  # ціни по брокерах
+    price_quote_date: Optional[date] = None
+    # Календарна дата, на яку last_market_price/broker_prices були актуальні (дата скрейпу
+    # снепшоту, з якого побудовано цей Bond) — НЕ дата settlement_date, з якою цей Bond
+    # можуть використати пізніше. math_core.entry_price() використовує цю дату як якір, щоб
+    # коректно спроєктувати ціну на довільний settlement_date (а не просто повернути сирий
+    # скрейплений dirty price, що коректний лише коли settlement_date ≈ ця дата). None —
+    # коли Bond побудовано не зі снепшоту (hand-built у тестах, analytics_service._to_domain_bond)
+    # — entry_price() тоді деградує до трактування ціни як актуальної на сам settlement_date.
 
     def price_for_broker(self, broker: str) -> Optional[Decimal]:
         """Повертає dirty price для конкретного брокера або None якщо не знайдено."""
