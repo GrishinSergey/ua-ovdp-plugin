@@ -10,7 +10,7 @@ A working, installable Claude Code plugin, pushed to
 [GrishinSergey/ua-ovdp-plugin](https://github.com/GrishinSergey/ua-ovdp-plugin) (`master`):
 
 - `.claude-plugin/plugin.json` — plugin manifest (name `ua-ovdp-plugin`), now carrying a
-  semver `version` (current: `1.0.2`, git tag `v1.0.2`; first tagged release was `1.0.1`)
+  semver `version` (current: `1.0.3`, git tag `v1.0.3`; first tagged release was `1.0.1`)
   — see "Versioning & pinning" below for what this field does and doesn't do.
 - `.claude-plugin/marketplace.json` — makes this repo installable as its own single-plugin
   marketplace (`source: "./"`, same repo). Without this file the plugin is NOT installable
@@ -55,7 +55,7 @@ conflate them:
 - **Pinning to a specific released version from another project** is done at the
   *marketplace-add* step, via a git ref/tag — not via the `version` string:
   ```
-  claude plugin marketplace add GrishinSergey/ua-ovdp-plugin#v1.0.2
+  claude plugin marketplace add GrishinSergey/ua-ovdp-plugin#v1.0.3
   ```
   or, in that project's `.claude/settings.json`:
   ```json
@@ -64,7 +64,7 @@ conflate them:
       "source": {
         "source": "github",
         "repo": "GrishinSergey/ua-ovdp-plugin",
-        "ref": "v1.0.2"
+        "ref": "v1.0.3"
       }
     }
   }

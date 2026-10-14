@@ -322,8 +322,16 @@ def calculate_position_metrics(
 
     total_invested       = position.total_invested
     remaining_invested   = (total_invested - realized_income).quantize(PRECISION)
+    # forward_profit already nets `realized_income` out of total_invested via
+    # remaining_invested above, so it's already the full lifetime profit
+    # (= total_expected_profit_gross below), not just "profit still to come".
+    # `total_profit` used to be `realized_profit + forward_profit`, which
+    # added the already-received coupons' profit a second time — e.g. 1000
+    # invested, one 100 coupon received (ai_paid 20, so realized_profit=80),
+    # 1200 still owed: old total_profit = 80 + (1200 - 900) = 380, but the
+    # real lifetime profit (all cashflows − invested) is 1300 − 1000 = 300.
     forward_profit       = (total_gross - remaining_invested).quantize(PRECISION)
-    total_profit         = (realized_profit + forward_profit).quantize(PRECISION)
+    total_profit         = forward_profit
 
     ytm_gross  = None
     ytm_net    = None
