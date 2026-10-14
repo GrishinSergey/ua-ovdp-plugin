@@ -52,7 +52,7 @@ from typing import Any, Optional
 
 from mcp.server import FastMCP
 
-from engine.investment.domain.models import Portfolio
+from engine.investment.domain.models import Bond, Portfolio
 from engine.investment.forecast.finance import (
     calculate_accrued_interest,
     calculate_position_metrics,
@@ -243,6 +243,23 @@ def _load_engine_bonds(
     return bonds, warnings_by_isin
 
 
+def _live_price_for_position(record: dict[str, Any], live_bond: Optional[Bond]) -> Optional[Decimal]:
+    """Resolve the live dirty price for a position's OWN broker (record["broker"]),
+    falling back to live_bond.last_market_price (the cross-broker minimum set in
+    bond_from_snapshot) only when the position has no broker recorded, or that broker
+    isn't quoted in this snapshot. Without this, market_value/unrealized_pnl/current_ytm
+    silently priced every position at whichever broker happened to be cheapest in the
+    snapshot, regardless of which broker the position was actually bought on."""
+    if live_bond is None:
+        return None
+    broker = record.get("broker")
+    if broker:
+        price = live_bond.price_for_broker(broker)
+        if price is not None:
+            return price
+    return live_bond.last_market_price
+
+
 def _compute_portfolio_metrics(as_of: date, label: Optional[str], data_path: Optional[str]):
     """Shared by portfolio_metrics and simulate_reinvestment: load recorded positions
     (optionally filtered by label), enrich with live prices when a snapshot is available
@@ -262,7 +279,7 @@ def _compute_portfolio_metrics(as_of: date, label: Optional[str], data_path: Opt
     positions = [
         position_from_record(
             r, as_of,
-            live_price=(live_bonds[r["isin"]].last_market_price if r["isin"] in live_bonds else None),
+            live_price=_live_price_for_position(r, live_bonds.get(r["isin"])),
             live_price_quote_date=(live_bonds[r["isin"]].price_quote_date if r["isin"] in live_bonds else None),
         )
         for r in records
@@ -915,7 +932,7 @@ def position_metrics(
     try:
         path = _resolve_path(data_path)
         live_bond = _load_engine_bond(record["isin"], path)
-        live_price = live_bond.last_market_price if live_bond else None
+        live_price = _live_price_for_position(record, live_bond)
         live_price_quote_date = live_bond.price_quote_date if live_bond else None
         if live_bond is not None:
             live_meta = _snapshot_meta(path)

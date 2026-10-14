@@ -10,7 +10,7 @@ A working, installable Claude Code plugin, pushed to
 [GrishinSergey/ua-ovdp-plugin](https://github.com/GrishinSergey/ua-ovdp-plugin) (`master`):
 
 - `.claude-plugin/plugin.json` — plugin manifest (name `ua-ovdp-plugin`), now carrying a
-  semver `version` (current: `1.0.3`, git tag `v1.0.3`; first tagged release was `1.0.1`)
+  semver `version` (current: `1.0.4`, git tag `v1.0.4`; first tagged release was `1.0.1`)
   — see "Versioning & pinning" below for what this field does and doesn't do.
 - `.claude-plugin/marketplace.json` — makes this repo installable as its own single-plugin
   marketplace (`source: "./"`, same repo). Without this file the plugin is NOT installable
@@ -55,7 +55,7 @@ conflate them:
 - **Pinning to a specific released version from another project** is done at the
   *marketplace-add* step, via a git ref/tag — not via the `version` string:
   ```
-  claude plugin marketplace add GrishinSergey/ua-ovdp-plugin#v1.0.3
+  claude plugin marketplace add GrishinSergey/ua-ovdp-plugin#v1.0.4
   ```
   or, in that project's `.claude/settings.json`:
   ```json
@@ -64,7 +64,7 @@ conflate them:
       "source": {
         "source": "github",
         "repo": "GrishinSergey/ua-ovdp-plugin",
-        "ref": "v1.0.3"
+        "ref": "v1.0.4"
       }
     }
   }
@@ -309,6 +309,37 @@ model/schemas if a real discrepancy ever needs logging instead — nothing curre
   populated regardless. `compute_ytm` (`server.py`'s own standalone bisection solver) has a
   structurally similar staleness gap in spirit but was left out of scope — see its own bullet
   below.
+- ~~`finance.calculate_position_metrics()`'s `total_profit` double-counted already-received
+  coupons~~ **Fixed (`1.0.3`).** `total_profit` was `realized_profit + forward_profit`, but
+  `forward_profit` is derived from `remaining_invested` (`total_invested - realized_income`),
+  which already nets received coupons out of invested capital — adding `realized_profit` on
+  top counted that same income's profit contribution a second time. `forward_profit` alone
+  (already exposed as `total_expected_profit_gross`/`_net`) is the correct full-lifetime
+  figure; `total_profit` now equals it directly. `calculate_portfolio_metrics`'s aggregate
+  `total_profit` (a plain sum over positions) self-corrected with no separate change.
+  `realized_profit` itself was untouched and still reported separately.
+- ~~`position_metrics`/`portfolio_metrics` priced every position at whichever broker
+  happened to be cheapest in the snapshot, regardless of which broker it was actually bought
+  on~~ **Fixed (`1.0.4`).** `market_bridge.bond_from_snapshot()` sets
+  `Bond.last_market_price = min(broker_prices)` as the snapshot's own *default* price — that
+  part is correct and unchanged. The bug was downstream: `server.py`'s
+  `_compute_portfolio_metrics()`/`position_metrics()` both read that cross-broker minimum
+  straight off the live `Bond` and handed it to `market_bridge.position_from_record()` as
+  `live_price`, ignoring the position's own recorded `broker` field entirely (itself present
+  on every stored record, just never consulted for pricing) — `Bond.price_for_broker()`
+  already existed and was already used correctly by `compare_bonds`/`build_target_portfolio`,
+  just never by these two tools. For a user whose broker isn't the cheapest one in a given
+  snapshot (the common case here: Приват24 is consistently priced a few % above Sense),
+  `market_value`/`unrealized_pnl`/`current_ytm` were silently computed off a broker the
+  position was never actually held at — in one reported case showing an 18.2–18.5%
+  `current_ytm` and a −24,486 `unrealized_pnl` where the Приват24-correct figures were
+  15.9–16.5% and +28,244. New shared helper `server._live_price_for_position(record,
+  live_bond)` resolves `live_bond.price_for_broker(record["broker"])` first, falling back to
+  `live_bond.last_market_price` (the cross-broker minimum) only when the position has no
+  broker recorded or that broker isn't quoted in the live snapshot — used by both tools now.
+  Verified against real portfolio data: `current_ytm`/`total_unrealized_pnl` now match the
+  independently-computed `compute_ytm(broker="Приват24")` figures (previously off by exactly
+  the Приват24-vs-cheapest-broker price gap).
 - `analytics_service._to_domain_bond` hardcodes `face_value=Decimal("1000")`, ignoring
   `BondInput.face_value` entirely. Harmless in practice (OVDP face value is always 1000 UAH)
   but means that schema field does nothing today. (Moot for anything MCP-driven — that path
